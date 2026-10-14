@@ -1327,6 +1327,18 @@ CREATE INDEX IF NOT EXISTS idx_plugin_blob_expiry
 CREATE INDEX IF NOT EXISTS idx_plugin_blob_listing
   ON plugin_blob_entries(plugin_id, namespace, created_at, entry_key);
 
+-- Permanent conditional local install receipts; no automatic expiry or tree cleanup.
+CREATE TABLE IF NOT EXISTS skill_local_install_requests (
+  request_id TEXT NOT NULL PRIMARY KEY,
+  binding TEXT NOT NULL,
+  target_key TEXT NOT NULL,
+  active INTEGER NOT NULL CHECK (active IN (0, 1)),
+  receipt_json TEXT NOT NULL
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_local_install_active_target
+  ON skill_local_install_requests(target_key) WHERE active = 1;
+
 CREATE TABLE IF NOT EXISTS skill_uploads (
   upload_id TEXT NOT NULL PRIMARY KEY,
   kind TEXT NOT NULL,

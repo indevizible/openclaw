@@ -14,6 +14,10 @@ import { hasErrnoCode } from "./errno.js";
 import { isRemovalIoError, removePathWithinRoot } from "./fs-safe-remove.js";
 import { FsSafeError, pathExists } from "./fs-safe.js";
 import { resolveInstallWorkTimeoutMs } from "./install-mode-options.js";
+import type {
+  ConditionalInstallResult,
+  ConditionalPackageInstall,
+} from "./install-package-dir-conditional.types.js";
 import { withInstallActivity, type InstallActivityObserver } from "./install-progress.js";
 import { assertCanonicalPathWithinBase } from "./install-safe-path.js";
 import { formatNpmCommandFailureOutput } from "./install-source-utils.js";
@@ -39,8 +43,14 @@ type HiddenProjectConfigFile = {
   hiddenPath: string;
 } | null;
 
-type InstallPackageDirFailure = { ok: false; error: string; recoveryIncomplete?: boolean };
-type InstallPackageDirSuccess = { ok: true };
+type InstallPackageDirFailure = {
+  ok: false;
+  error: string;
+  recoveryIncomplete?: boolean;
+  conditional?: ConditionalInstallResult;
+  observations?: unknown;
+};
+type InstallPackageDirSuccess = { ok: true; conditional?: ConditionalInstallResult };
 
 export function hasPackageRuntimeDependencies(manifest: {
   dependencies?: Record<string, string>;
@@ -269,7 +279,15 @@ export async function installPackageDir<
   /** Remote owners answer before displacement/publication; local checks still run at the mutation. */
   authorizeMutation?: () => Promise<void>;
   requireExistingTarget?: boolean;
+  conditional?: ConditionalPackageInstall;
 }): Promise<InstallPackageDirSuccess | InstallPackageDirFailure | TAfterInstallFailure> {
+  if (params.conditional) {
+    if (resolvePackageDirInstallTransactionRequest(params)) {
+      return { ok: false, error: "Conditional install cannot use deferred replacement." };
+    }
+    const { installConditionalPackageDir } = await import("./install-package-dir-conditional.js");
+    return installConditionalPackageDir(params);
+  }
   const transactionRequest = resolvePackageDirInstallTransactionRequest(params);
   const deferCommit = transactionRequest !== undefined;
   // A retry cannot revive a refused transaction or borrow a successor's lease.

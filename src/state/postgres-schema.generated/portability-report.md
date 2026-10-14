@@ -12,11 +12,11 @@
 
 | Database | Object        | Total | Translated | Reported |
 | -------- | ------------- | ----: | ---------: | -------: |
-| state    | table         |   134 |        134 |        0 |
-| state    | column        |  1394 |       1392 |        2 |
-| state    | index         |   296 |        296 |        0 |
+| state    | table         |   135 |        135 |        0 |
+| state    | column        |  1399 |       1397 |        2 |
+| state    | index         |   298 |        298 |        0 |
 | state    | foreignKey    |    32 |         32 |        0 |
-| state    | check         |   293 |        293 |        0 |
+| state    | check         |   294 |        294 |        0 |
 | state    | trigger       |     0 |          0 |        0 |
 | state    | virtualTable  |     0 |          0 |        0 |
 | state    | internalTable |     1 |          0 |        1 |
@@ -45,6 +45,7 @@
 - outbound_message_progress.sequence: rowid alias becomes identity; AUTOINCREMENT/sqlite_sequence never-reuse semantics differ: PostgreSQL sequences are nontransactional and explicit values do not advance them.
 - session_repository_workspaces.run_setup_script: 0/1 boolean candidate retained as bigint.
 - session_state_events.sequence: rowid alias becomes identity; AUTOINCREMENT/sqlite_sequence never-reuse semantics differ: PostgreSQL sequences are nontransactional and explicit values do not advance them.
+- skill_local_install_requests.active: 0/1 boolean candidate retained as bigint.
 - internalTable `sqlite_sequence.sqlite_sequence`: SQLite-owned storage is not translated. Source: `CREATE TABLE sqlite_sequence(name,seq)`
 - column `sqlite_sequence.name`: Parent table omitted. Source: ``
 - column `sqlite_sequence.seq`: Parent table omitted. Source: ``

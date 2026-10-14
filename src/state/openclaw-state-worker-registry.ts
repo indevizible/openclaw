@@ -78,6 +78,10 @@ const loaders = {
     import("../skills/library/store.worker.js").then((m) => m.skillLibraryOperations),
   skillUploads: () =>
     import("../skills/lifecycle/upload-store.worker.js").then((m) => m.skillUploadOperations),
+  conditionalSkillInstall: () =>
+    import("../skills/lifecycle/conditional-install.worker.js").then(
+      (m) => m.conditionalSkillInstallOperations,
+    ),
   skills: () =>
     import("../skills/workshop/changes.worker.js").then((m) => m.skillWorkshopOperations),
   transcripts: () =>

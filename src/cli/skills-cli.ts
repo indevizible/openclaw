@@ -36,6 +36,7 @@ import {
   updateSkillsFromClawHub,
   verifySkillWithClawHub,
 } from "../skills/lifecycle/clawhub.js";
+import { inspectSkillDestination } from "../skills/lifecycle/installed-revision.js";
 import {
   installSkillFromSource,
   isSkillSourceInstallSpec,
@@ -221,6 +222,54 @@ async function resolveClawHubTargetWorkspace(
   return resolveSkillsWorkspace({ agentId });
 }
 
+async function withSkillsOfflineCustody<T>(
+  target: Pick<ResolvedSkillsWorkspace, "config">,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const { isImplicitLocalGatewayTarget } = await import("../gateway/call.js");
+  if (!(await isImplicitLocalGatewayTarget({ config: target.config }))) {
+    throw new Error("Conditional skills require local offline state ownership.");
+  }
+  const { acquireGatewayLock } = await import("../infra/gateway-lock.js");
+  const lock = await acquireGatewayLock({
+    allowInTests: true,
+    port: resolveGatewayPort(target.config, process.env),
+    role: "sqlite-maintenance",
+    timeoutMs: GATEWAY_SKILLS_OFFLINE_LOCK_TIMEOUT_MS,
+  });
+  if (!lock) {
+    throw new Error("Stop the local Gateway before a conditional skill operation.");
+  }
+  try {
+    return await lock.run(operation);
+  } finally {
+    await lock.release();
+  }
+}
+
+function printConditionalOutcome(result: {
+  conditional?: import("../infra/install-package-dir-conditional.types.js").ConditionalInstallResult;
+}) {
+  const details = result.conditional;
+  if (!details) {
+    return;
+  }
+  defaultRuntime.log(
+    `Request ${details.requestId}: recorded outcome ${details.recordedPhase ?? "unconfirmed"}; status ${details.status}.`,
+  );
+  if (details.current) {
+    const current = details.current;
+    defaultRuntime.log(
+      `Current destination: ${current.state}${current.state === "present" ? `; revision ${current.revision ?? "unreadable"}; matches recorded publication: ${current.matchesPublished}` : ""}.`,
+    );
+  }
+  if (details.backupDir) {
+    defaultRuntime.log(
+      `Retained backup path: ${details.backupDir} (may be absent; no automatic cleanup).`,
+    );
+  }
+}
+
 function shouldFailSkillVerification(result: ClawHubSkillVerificationResponse): boolean {
   const envelope = result as { ok: unknown; decision: unknown };
   return envelope.ok !== true || envelope.decision !== "pass";
@@ -333,6 +382,13 @@ export function registerSkillsCli(program: Command) {
     .option("--global", "Install into the shared managed skills directory", false)
     .option("--agent <id>", "Target agent workspace (defaults to cwd-inferred, then default agent)")
     .option("--as <slug>", "Install a git/local skill under this slug")
+    .option("--if-absent", "Publish a local directory only if the destination is absent")
+    .option(
+      "--if-revision <revision>",
+      "Replace a local directory after validating the displaced complete revision",
+    )
+    .option("--request-id <id>", "Permanent idempotency ID for a conditional local install")
+    .option("--json", "Output conditional install results as JSON", false)
     .addHelpText(
       "after",
       "\nExamples:\n  openclaw skills install @owner/weather\n  openclaw skills install skills-sh:owner/repo/weather\n",
@@ -348,11 +404,38 @@ export function registerSkillsCli(program: Command) {
           global?: boolean;
           agent?: string;
           as?: string;
+          ifAbsent?: boolean;
+          ifRevision?: string;
+          requestId?: string;
+          json?: boolean;
         },
         command: Command,
       ) => {
+        const conditionalRequested =
+          opts.ifAbsent || opts.ifRevision !== undefined || opts.requestId !== undefined;
+        const reportError =
+          conditionalRequested && hasJsonOutput(opts)
+            ? (message: string) => defaultRuntime.writeJson({ ok: false, error: message })
+            : defaultRuntime.error;
         try {
-          const target = await resolveClawHubTargetWorkspace(command, opts);
+          if (
+            conditionalRequested &&
+            (Boolean(opts.ifAbsent) === (opts.ifRevision !== undefined) ||
+              !opts.requestId ||
+              opts.force ||
+              opts.forceInstall ||
+              opts.version !== undefined ||
+              !isSkillSourceInstallSpec(slug) ||
+              slug.trim().toLowerCase().startsWith("git:"))
+          ) {
+            throw new Error(
+              "Use exactly one of --if-absent or --if-revision with --request-id and an explicit local directory; force and registry options are not supported.",
+            );
+          }
+          if (hasJsonOutput(opts) && !conditionalRequested) {
+            throw new Error("skills install --json requires a conditional local install.");
+          }
+          const target = await resolveClawHubTargetWorkspace(command, opts, reportError);
           if (!target) {
             return;
           }
@@ -374,26 +457,60 @@ export function registerSkillsCli(program: Command) {
               defaultRuntime.exit(1);
               return;
             }
-            const result = await installSkillFromSource({
-              workspaceDir,
-              spec: slug,
-              slug: opts.as,
-              force: Boolean(opts.force),
-              config,
-              ...resolveInstallPolicyWarningAcknowledgementCliOptions({
-                acknowledgeInstallPolicyWarning: opts.acknowledgeInstallPolicyWarning,
-              }),
-              logger: skillInstallLogger,
-            });
+            const install = () =>
+              installSkillFromSource({
+                workspaceDir,
+                spec: slug,
+                slug: opts.as,
+                force: Boolean(opts.force),
+                config,
+                ...resolveInstallPolicyWarningAcknowledgementCliOptions({
+                  acknowledgeInstallPolicyWarning: opts.acknowledgeInstallPolicyWarning,
+                }),
+                logger:
+                  conditionalRequested && hasJsonOutput(opts)
+                    ? { warn: defaultRuntime.error }
+                    : skillInstallLogger,
+                ...(conditionalRequested
+                  ? {
+                      conditional: {
+                        requestId: opts.requestId!,
+                        condition: opts.ifAbsent
+                          ? { kind: "absent" as const }
+                          : { kind: "revision" as const, revision: opts.ifRevision! },
+                      },
+                    }
+                  : {}),
+              });
+            let result: Awaited<ReturnType<typeof install>>;
+            if (conditionalRequested) {
+              result = await withSkillsOfflineCustody(target, install);
+            } else {
+              result = await install();
+            }
+            if (conditionalRequested && hasJsonOutput(opts)) {
+              defaultRuntime.writeJson(result);
+              if (!result.ok) {
+                defaultRuntime.exit(1);
+              }
+              return;
+            }
+            if (conditionalRequested) {
+              printConditionalOutcome(result);
+            }
             if (!result.ok) {
               defaultRuntime.error(result.error);
               defaultRuntime.exit(1);
               return;
             }
-            await refreshLocalGatewaySkills(target);
-            defaultRuntime.log(
-              `Installed ${result.slug} from ${result.source} -> ${result.targetDir}`,
-            );
+            if (!conditionalRequested) {
+              await refreshLocalGatewaySkills(target);
+            }
+            if (!result.conditional?.repeated) {
+              defaultRuntime.log(
+                `Installed ${result.slug} from ${result.source} -> ${result.targetDir}`,
+              );
+            }
             return;
           }
           if (opts.as) {
@@ -434,9 +551,107 @@ export function registerSkillsCli(program: Command) {
           if (err instanceof ExitError) {
             throw err;
           }
-          defaultRuntime.error(formatErrorMessage(err));
+          reportError(formatErrorMessage(err));
           defaultRuntime.exit(1);
         }
+      },
+    );
+
+  skills
+    .command("inspect")
+    .description("Inspect the exact local writable skill destination and complete revision")
+    .option(
+      "--request-id <id>",
+      "Read recorded request history and current artifacts without mutation",
+    )
+    .argument("<slug>", "Destination directory slug")
+    .option("--global", "Inspect the shared managed skills destination", false)
+    .option("--agent <id>", "Target agent workspace")
+    .option("--json", "Output as JSON", false)
+    .action(
+      async (slug: string, opts: { global?: boolean; requestId?: string }, command: Command) => {
+        const reportError = (message: string) =>
+          defaultRuntime.writeJson(formatCliJsonFailure(message));
+        try {
+          const target = await resolveClawHubTargetWorkspace(command, opts, reportError);
+          if (target) {
+            const { isImplicitLocalGatewayTarget } = await import("../gateway/call.js");
+            if (!(await isImplicitLocalGatewayTarget({ config: target.config }))) {
+              throw new Error("Skill destination inspection requires a local Gateway target.");
+            }
+            const params = { workspaceDir: target.workspaceDir, slug };
+            if (opts.requestId !== undefined) {
+              const { inspectConditionalSkillRequest } =
+                await import("../skills/lifecycle/conditional-install-journal.js");
+              defaultRuntime.writeJson(
+                await inspectConditionalSkillRequest({ ...params, requestId: opts.requestId }),
+              );
+            } else {
+              defaultRuntime.writeJson(await inspectSkillDestination(params));
+            }
+          }
+        } catch (err) {
+          if (err instanceof ExitError) {
+            throw err;
+          }
+          reportError(formatErrorMessage(err));
+          defaultRuntime.exit(1);
+        }
+      },
+    );
+
+  skills
+    .command("recover")
+    .description("Reconcile a conditional local request offline, preserving every tree")
+    .argument("<slug>", "Destination directory slug")
+    .requiredOption("--request-id <id>", "Recorded conditional request ID")
+    .option("--global", "Target the shared managed skills destination", false)
+    .option("--agent <id>", "Target agent workspace")
+    .option("--json", "Output as JSON", false)
+    .action(
+      async (
+        slug: string,
+        opts: { global?: boolean; requestId: string; json?: boolean },
+        command: Command,
+      ) => {
+        const json = hasJsonOutput(opts);
+        const reportError = json
+          ? (message: string) => defaultRuntime.writeJson(formatCliJsonFailure(message))
+          : defaultRuntime.error;
+        await runCommandWithRuntime(defaultRuntime, async () => {
+          try {
+            const target = await resolveClawHubTargetWorkspace(command, opts, reportError);
+            if (!target) {
+              return;
+            }
+            const { recoverConditionalSkillRequest } =
+              await import("../skills/lifecycle/conditional-install-journal.js");
+            const result = await withSkillsOfflineCustody(target, () =>
+              recoverConditionalSkillRequest({
+                workspaceDir: target.workspaceDir,
+                slug,
+                requestId: opts.requestId,
+              }),
+            );
+            if (json) {
+              defaultRuntime.writeJson(result);
+            } else {
+              printConditionalOutcome(result);
+              if (!result.ok) {
+                defaultRuntime.error(result.error);
+              }
+            }
+            if (!result.ok) {
+              defaultRuntime.exit(1);
+            }
+          } catch (err) {
+            if (err instanceof ExitError || !json) {
+              throw err;
+            }
+            reportError(formatErrorMessage(err));
+            defaultRuntime.exit(1);
+          }
+        });
       },
     );
 

@@ -5,6 +5,10 @@ import type {
   ClawHubSkillVerificationResponse,
   ClawHubSkillsShTrustState,
 } from "../../infra/clawhub-skills.js";
+import type {
+  ConditionalInstallResult,
+  ConditionalPackageInstall,
+} from "../../infra/install-package-dir-conditional.types.js";
 import type { PackageDirInstallTransaction } from "../../infra/install-package-dir.js";
 import type {
   PluginHookSkillArtifact,
@@ -16,13 +20,20 @@ import type { ClawHubSkillFileState } from "./skill-tree-digest.js";
 
 /** Result shape for installing a skill archive into a workspace skills dir. */
 export type SkillArchiveInstallResult =
-  | { ok: true; targetDir: string; transaction?: PackageDirInstallTransaction }
+  | {
+      ok: true;
+      targetDir: string;
+      transaction?: PackageDirInstallTransaction;
+      conditional?: ConditionalInstallResult;
+    }
   | {
       ok: false;
       error: string;
       failureKind: SkillArchiveInstallFailureKind;
       replacementBlocked?: string;
       recoveryIncomplete?: boolean;
+      conditional?: ConditionalInstallResult;
+      observations?: unknown;
     };
 
 export type SkillArchiveInstallFailureKind = "invalid-request" | "unavailable";
@@ -43,6 +54,8 @@ export type SkillRootInstallFiles = {
   expectedClawHubState?: ClawHubSkillFileState | null;
   /** Retain the previous directory until the package install settles. */
   deferCommit?: boolean;
+  /** Local-only conditional publication, rejected by the archive owner for remote adapters. */
+  conditional?: ConditionalPackageInstall;
 };
 
 export type SkillRootApplyResult =
@@ -53,6 +66,7 @@ export type SkillRootApplyResult =
       before?: PluginHookSkillArtifact;
       after?: PluginHookSkillArtifact;
       transaction?: PackageDirInstallTransaction;
+      conditional?: ConditionalInstallResult;
     }
   | Extract<SkillArchiveInstallResult, { ok: false }>;
 
@@ -196,6 +210,7 @@ export type WorkspaceSkillLifecycle = {
       };
       beforeInstall?: (
         mode: "install" | "update",
+        sourceDir?: string,
       ) => Promise<{ error: string; failureKind: SkillArchiveInstallFailureKind } | undefined>;
     },
   ) => Promise<SkillRootApplyResult>;

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
@@ -8,6 +9,11 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { acquireGitSource } from "../../infra/git-source.js";
 import { sanitizeHostExecEnv } from "../../infra/host-env-security.js";
+import type {
+  ConditionalInstallResult,
+  ConditionalPackageInstall,
+  PackageDirectoryCondition,
+} from "../../infra/install-package-dir-conditional.types.js";
 import { withInstallWorkspace } from "../../infra/install-source-utils.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { isImmutableGitCommitRef, parseGitPluginSpec } from "../../plugins/git-install.js";
@@ -20,8 +26,18 @@ import {
 } from "../loading/local-loader.js";
 import { resolveSkillDiscoveryLimits } from "../loading/skill-root-discovery.js";
 import { installExtractedSkillRoot } from "./archive-install.js";
+import { untrackClawHubSkill } from "./clawhub-store.js";
 import { validateRequestedSkillSlug } from "./install-paths.js";
-import { recordSkillSourceInstall, type SkillSourceOrigin } from "./source-install-metadata.js";
+import {
+  assertLocalSkillWorkspace,
+  readInstalledSkillRevision,
+  resolveLocalSkillDestination,
+} from "./installed-revision.js";
+import {
+  prepareSkillSourceMetadata,
+  recordSkillSourceInstall,
+  type SkillSourceOrigin,
+} from "./source-install-metadata.js";
 
 const log = createSubsystemLogger("skills");
 
@@ -39,6 +55,8 @@ type SkillSourceInstallParams = {
   logger?: Logger;
   config?: OpenClawConfig;
   onInstallPolicyWarning?: InstallSafetyOverrides["onInstallPolicyWarning"];
+  conditional?: { requestId: string; condition: PackageDirectoryCondition };
+  beforePersistentApply?: () => void;
 };
 
 type SkillSourceInstallResult =
@@ -48,8 +66,15 @@ type SkillSourceInstallResult =
       targetDir: string;
       source: "path" | "git";
       git?: SkillSourceOrigin["git"];
+      conditional?: ConditionalInstallResult;
     }
-  | { ok: false; error: string };
+  | {
+      ok: false;
+      error: string;
+      conditional?: ConditionalInstallResult;
+      recoveryIncomplete?: boolean;
+      observations?: unknown;
+    };
 
 async function resolveSkillInstallSlug(params: {
   sourceDir: string;
@@ -114,6 +139,12 @@ async function installLocalSkillDir(
     git?: SkillSourceOrigin["git"];
   },
 ): Promise<SkillSourceInstallResult> {
+  const conditionalSource = params.conditional
+    ? {
+        ...params.conditional,
+        sourceRevision: await readInstalledSkillRevision(params.sourceDir),
+      }
+    : undefined;
   const slug = await resolveSkillInstallSlug({
     sourceDir: params.sourceDir,
     fallbackLabel: params.fallbackLabel,
@@ -132,13 +163,68 @@ async function installLocalSkillDir(
     return { ok: false, error: "Remote workspace skill source tracking is unavailable" };
   }
   const recordInstall = access?.recordSkillSourceInstall ?? recordSkillSourceInstall;
+  let conditional: ConditionalPackageInstall | undefined;
+  if (conditionalSource) {
+    const { installDirectoryIdentity } =
+      await import("../../infra/install-package-dir-conditional.js");
+    const { createConditionalInstallJournal } = await import("./conditional-install-journal.js");
+    const destination = await resolveLocalSkillDestination({
+      workspaceDir: params.workspaceDir,
+      slug,
+    });
+    const workspaceIdentity = installDirectoryIdentity(destination.workspaceDir);
+    const assertCurrent = () => {
+      assertLocalSkillWorkspace(params.workspaceDir);
+      params.beforePersistentApply?.();
+    };
+    conditional = {
+      ...conditionalSource,
+      workspaceDir: destination.workspaceDir,
+      workspaceIdentity,
+      binding: createHash("sha256")
+        .update(
+          JSON.stringify({
+            workspaceDir: destination.workspaceDir,
+            workspaceIdentity,
+            targetDir: destination.targetDir,
+            sourceDir: await fs.realpath(params.sourceDir),
+            sourceSpec: params.sourceSpec,
+            sourceRevision: conditionalSource.sourceRevision,
+            condition: conditionalSource.condition,
+          }),
+        )
+        .digest("hex"),
+      readRevision: readInstalledSkillRevision,
+      prepareStage: (targetDir) =>
+        prepareSkillSourceMetadata({
+          workspaceDir: destination.workspaceDir,
+          targetDir,
+          origin: {
+            version: 1,
+            source: "path",
+            spec: params.sourceSpec,
+            slug,
+            installedAt: Date.now(),
+          },
+        }),
+      afterPublication: async (assertPublished) => {
+        await untrackClawHubSkill(destination.workspaceDir, slug, () => {
+          assertCurrent();
+          assertPublished();
+        });
+      },
+      journal: createConditionalInstallJournal(assertCurrent),
+    };
+  }
   const install = await installExtractedSkillRoot({
-    workspaceDir: params.workspaceDir,
+    workspaceDir: conditional?.workspaceDir ?? params.workspaceDir,
     slug,
     extractedRoot: params.sourceDir,
     mode: params.force ? "update" : "install",
     timeoutMs: params.timeoutMs,
     logger: params.logger,
+    conditional,
+    beforePersistentApply: params.beforePersistentApply,
     policy: {
       config: params.config,
       onInstallPolicyWarning: params.onInstallPolicyWarning,
@@ -162,26 +248,28 @@ async function installLocalSkillDir(
     },
   });
   if (!install.ok) {
-    return { ok: false, error: install.error };
+    return conditional ? install : { ok: false, error: install.error };
   }
 
-  await recordInstall({
-    workspaceDir: params.workspaceDir,
-    targetDir: install.targetDir,
-    origin: {
-      version: 1,
-      source: params.source,
-      spec: params.sourceSpec,
-      slug,
-      installedAt: Date.now(),
-      ...(params.git ? { git: params.git } : {}),
-    },
-  });
-  try {
-    const { refreshSkillsDiscovery } = await import("../runtime/refresh.js");
-    await refreshSkillsDiscovery({ workspaceDir: params.workspaceDir, config: params.config });
-  } catch (error) {
-    log.warn(`Skill source saved, but discovery refresh failed: ${formatErrorMessage(error)}`);
+  if (!conditional) {
+    await recordInstall({
+      workspaceDir: params.workspaceDir,
+      targetDir: install.targetDir,
+      origin: {
+        version: 1,
+        source: params.source,
+        spec: params.sourceSpec,
+        slug,
+        installedAt: Date.now(),
+        ...(params.git ? { git: params.git } : {}),
+      },
+    });
+    try {
+      const { refreshSkillsDiscovery } = await import("../runtime/refresh.js");
+      await refreshSkillsDiscovery({ workspaceDir: params.workspaceDir, config: params.config });
+    } catch (error) {
+      log.warn(`Skill source saved, but discovery refresh failed: ${formatErrorMessage(error)}`);
+    }
   }
 
   return {
@@ -189,6 +277,7 @@ async function installLocalSkillDir(
     slug,
     targetDir: install.targetDir,
     source: params.source,
+    ...(install.conditional ? { conditional: install.conditional } : {}),
     ...(params.git ? { git: params.git } : {}),
   };
 }
@@ -265,6 +354,34 @@ export async function installSkillFromSource(
   params: SkillSourceInstallParams,
 ): Promise<SkillSourceInstallResult> {
   const spec = params.spec.trim();
+  if (params.conditional) {
+    const { requestId, condition } = params.conditional;
+    if (
+      !requestId ||
+      requestId !== requestId.trim() ||
+      requestId.length > 200 ||
+      !/^[A-Za-z0-9._:-]+$/.test(requestId) ||
+      (condition.kind !== "absent" && condition.kind !== "revision") ||
+      (condition.kind === "revision" && !/^skill-v1:sha256:[a-f0-9]{64}$/.test(condition.revision))
+    ) {
+      return {
+        ok: false,
+        error:
+          "Conditional install requires a valid request ID and absent or complete installed revision condition.",
+      };
+    }
+    if (params.force || !isSkillSourceInstallSpec(spec) || spec.toLowerCase().startsWith("git:")) {
+      return {
+        ok: false,
+        error: "Conditional install supports only explicit local directories and cannot use force.",
+      };
+    }
+    try {
+      assertLocalSkillWorkspace(params.workspaceDir);
+    } catch (error) {
+      return { ok: false, error: formatErrorMessage(error) };
+    }
+  }
   if (spec.toLowerCase().startsWith("git:")) {
     return await installGitSkill({ ...params, spec });
   }
@@ -278,11 +395,18 @@ export async function installSkillFromSource(
   if (!stat.isDirectory()) {
     return { ok: false, error: `Skill path is not a directory: ${sourceDir}` };
   }
-  return await installLocalSkillDir({
-    ...params,
-    sourceDir,
-    sourceSpec: spec,
-    source: "path",
-    fallbackLabel: path.basename(path.resolve(sourceDir)).trim(),
-  });
+  try {
+    return await installLocalSkillDir({
+      ...params,
+      sourceDir,
+      sourceSpec: spec,
+      source: "path",
+      fallbackLabel: path.basename(path.resolve(sourceDir)).trim(),
+    });
+  } catch (error) {
+    if (!params.conditional) {
+      throw error;
+    }
+    return { ok: false, error: formatErrorMessage(error) };
+  }
 }

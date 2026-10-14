@@ -204,6 +204,116 @@ async function runCommand(argv: string[]) {
 
 describe("skills cli commands", () => {
   it.each([
+    ["./sample", "--if-absent"],
+    ["./sample", "--request-id", "example"],
+    ["./sample", "--if-absent", "--if-revision", "revision", "--request-id", "example"],
+    ["./sample", "--if-absent", "--request-id", "example", "--force"],
+    ["@owner/sample", "--if-absent", "--request-id", "example"],
+    ["git:owner/sample", "--if-absent", "--request-id", "example"],
+  ])("rejects contradictory conditional install transport: %j", async (...args) => {
+    await expect(runCommand(["install", ...args, "--json"])).rejects.toThrow("__exit__:1");
+    expect(JSON.parse(mocks.stdout[0]!)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("Use exactly one"),
+    });
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(mocks.sourceInstall).not.toHaveBeenCalled();
+  });
+
+  it("rejects ordinary install JSON instead of emitting human success text", async () => {
+    await expect(runCommand(["install", "./sample", "--json"])).rejects.toThrow("__exit__:1");
+    expect(mocks.errors.join("\n")).toContain("requires a conditional");
+    expect(mocks.stdout).toHaveLength(0);
+    expect(mocks.runtime.log).not.toHaveBeenCalled();
+    expect(mocks.sourceInstall).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      argv: ["install", "./sample", "--if-absent", "--request-id", "example", "--json"],
+      failure: "selector",
+      output: "install-json",
+    },
+    { argv: ["inspect", "sample"], failure: "selector", output: "json" },
+    { argv: ["inspect", "sample"], failure: "lookup", output: "json" },
+    {
+      argv: ["recover", "sample", "--request-id", "example", "--json"],
+      failure: "selector",
+      output: "json",
+    },
+    {
+      argv: ["--json", "recover", "sample", "--request-id", "example"],
+      failure: "lookup",
+      output: "json",
+    },
+    {
+      argv: ["recover", "sample", "--request-id", "example", "--json"],
+      failure: "custody",
+      output: "json",
+    },
+    {
+      argv: ["recover", "sample", "--request-id", "example"],
+      failure: "lookup",
+      output: "human",
+    },
+  ])("reports one $output failure for $argv ($failure)", async ({ argv, failure, output }) => {
+    const message =
+      failure === "selector"
+        ? "Use either --global or --agent, not both."
+        : failure === "lookup"
+          ? "Synthetic workspace lookup failed."
+          : "Conditional skills require local offline state ownership.";
+    if (failure === "lookup") {
+      mocks.defaultAgent.mockImplementationOnce(() => {
+        throw new Error(message);
+      });
+    } else if (failure === "custody") {
+      mocks.config.mockReturnValue({ gateway: { mode: "remote" } });
+    }
+    const exit = new ExitError(1);
+    await mocks.runtime.exit.withImplementation(
+      () => {
+        throw exit;
+      },
+      async () => {
+        await expect(
+          runCommand([...argv, ...(failure === "selector" ? ["--global", "--agent", "main"] : [])]),
+        ).rejects.toBe(exit);
+      },
+    );
+    expect(mocks.runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
+    expect(mocks.errors).toEqual(output === "human" ? [message] : []);
+    expect(mocks.stdout.map((value) => JSON.parse(value))).toEqual(
+      output === "human"
+        ? []
+        : [
+            {
+              ok: false,
+              error: output === "install-json" ? message : { type: "cli_error", message },
+            },
+          ],
+    );
+    expect(mocks.runtime.log).not.toHaveBeenCalled();
+    expect(mocks.sourceInstall).not.toHaveBeenCalled();
+  });
+
+  it("inspects the selected writable destination without consulting discovery", async () => {
+    await withTestDir({ prefix: "skills-inspect-cli-" }, async (workspaceDir) => {
+      mocks.workspace.mockReturnValue(workspaceDir);
+      await runCommand(["inspect", "sample", "--agent", "example", "--json"]);
+      expect(JSON.parse(mocks.stdout[0]!)).toEqual({
+        slug: "sample",
+        workspaceDir,
+        targetDir: path.join(workspaceDir, "skills/sample"),
+        state: "absent",
+      });
+      expect(mocks.explicitAgent).toHaveBeenCalledWith({}, "example");
+      expect(mocks.status).not.toHaveBeenCalled();
+      expect(mocks.gateway).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each([
     {
       argv: ["install", "skills-sh/invalid"],
       message: "Invalid skills.sh skill reference: skills-sh/invalid",

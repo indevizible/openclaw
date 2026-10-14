@@ -41,6 +41,7 @@ describe("built-in machine-output resolvers", () => {
     expect(
       isSkillsMachineOutput(["node", "openclaw", "skills", "--log-level", "debug", "verify", "x"]),
     ).toBe(true);
+    expect(isSkillsMachineOutput(["node", "openclaw", "skills", "inspect", "sample"])).toBe(true);
     expect(
       isGatewayMachineOutput([
         "node",

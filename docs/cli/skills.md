@@ -61,6 +61,7 @@ openclaw skills list --eligible
 openclaw skills list --json
 openclaw skills list --verbose
 openclaw skills list --agent <id>
+openclaw skills inspect <slug> --json
 openclaw skills info <name>
 openclaw skills info <name> --json
 openclaw skills info <name> --agent <id>
@@ -137,6 +138,172 @@ the source directory or repository name; use `--as <slug>` to override it.
 `--version` is ClawHub-only. Skill installs do not support npm package specs
 or zip/archive paths, and `openclaw skills update` updates ClawHub-tracked
 installs only.
+
+## Conditional local directory installs
+
+**Draft prototype: destination conditions, permanent receipts, retention, and recovery
+still need upstream maintainer acceptance.** See [the design issue](https://github.com/openclaw/openclaw/issues/172142)
+and [the advisory review](https://github.com/openclaw/openclaw/issues/172142#issuecomment-6169274051).
+This implementation is not an accepted persistence design. Broad CI skips Draft
+PRs; focused local proof is required before review.
+
+Use a conditional install when automation must preserve an unexpected destination
+or local edits. Stop the local Gateway first: this CLI path acquires exclusive
+offline custody of the shared state database. Direct conditional API calls also
+require current maintenance custody of that exact database, including fresh
+installs and retries. The existing target queue serializes each entire attempt
+with recovery within that custody. The selected workspace must already exist.
+This Draft has no remote or Gateway protocol integration. Ordinary installs and updates keep their existing behavior.
+
+```bash
+openclaw skills inspect sample --agent example --json
+openclaw skills install ./sample --as sample --agent example \
+  --if-absent --request-id example-create-1 --json
+openclaw skills install ./sample --as sample --agent example \
+  --if-revision '<revision-from-inspect>' --request-id example-replace-1 --json
+```
+
+`inspect` always emits JSON for exactly the writable `workspace/skills/<slug>`
+destination. It does not use discovery precedence, skill display names, or
+`skills info`. An absent destination returns `state: "absent"`; a supported tree
+returns `state: "present"` and `revision: "skill-v1:sha256:..."`. Both include
+`slug`, canonical `workspaceDir`, and `targetDir`. The existing `--agent` selection
+rules apply; `--global` selects the shared managed destination and cannot be
+combined with `--agent`.
+
+Specify exactly one of `--if-absent` and `--if-revision`, plus `--request-id`.
+IDs are 1–200 ASCII letters, digits, periods, underscores, colons, or hyphens.
+An ID is permanent within that shared database. It binds the canonical workspace
+identity, destination, local source path and complete source content, and condition.
+Reusing it with different inputs fails. Repeating completed inputs returns the
+recorded outcome separately from the current destination observation. A completed
+receipt never overwrites later edits or repeats install hooks, provenance writes,
+ClawHub untracking, or discovery refresh. If the current destination is missing or
+changed, replay exits nonzero while retaining `recordedPhase: "installed"` and the
+historical `revision`. Human output labels the recorded outcome and current state.
+
+Complete revisions include every relative name, file byte, permission/mode bit,
+empty directory, root mode, and provenance file. They exclude timestamps and inode
+numbers from the content digest. Symlinks, hardlinked files, special files, and
+detected changes during reads fail closed. A revision is an observation, not an
+atomic tree snapshot. The existing ClawHub digest format is unchanged.
+
+Fresh publication uses strict native no-replace, so any existing destination,
+including a racing empty directory, prevents publication. Replacement first moves
+the current target to an owned, unique `previous` path with strict no-replace,
+then checks that displaced tree against the expected revision. It publishes the
+prepared stage only while the target name is absent. **Replacement is not an
+atomic tree-content compare-and-swap:** the target is briefly absent, readers
+holding descriptors can continue writing the displaced tree, and edits after
+validation are possible. Successful replacement retains that entire displaced
+tree for this reason. Native no-replace does not atomically bind the source inode:
+a source-name swap can move the then-current tree. This is not source inode CAS.
+The installer checks the published identity and complete revision before completion,
+and synchronously checks identity again at ClawHub tracking mutation. Observations
+are not locks: later edits and name replacements remain possible.
+
+If the displaced revision does not match, restoration also uses strict
+no-replace. If another target appears, both trees are preserved and recovery is
+required. Native calls can fail after moving a directory; such errors never
+trigger a blind rollback. Provenance is prepared inside staging before
+publication. No conditional install writes provenance into its published tree.
+Workspace ClawHub tracking and discovery/hooks retain their existing owners.
+
+`install --json` requires conditional mode; ordinary installs reject that flag.
+Conditional results contain `ok`, and on failure `error`. Once a request is
+confirmed, `conditional` includes `requestId`, `status`, `recordedPhase`, `targetDir`,
+`stageDir`, `backupDir`, and the prepared historical `revision` when available.
+`current` describes the observed target: `absent`, `unreadable`, or `present` with
+identity, revision when readable, and `matchesPublished`. `publicationObserved`
+records an observed publication; it does not promise that the tree still occupies
+the target. Replays add `repeated: true`. Status is `installed`, `conflict`, or
+`recovery-required`; it must be interpreted with `current` and `ok`.
+Confirmed claim refusals have no stage/backup paths and may identify
+`owningRequestId`. A lost claim reply reports an unknown claim outcome, without
+inventing artifact paths. Uncertain outcomes include `recoveryIncomplete`.
+
+Paths describe recorded locations; a stage or restored backup may no longer be
+present. A successful replacement retains the displaced tree at
+`workspace/skills/.openclaw-conditional-<unique-id>/previous`.
+There is **no automatic tree cleanup**, expiry, or cleanup command. Failed stages,
+probe directories, and successful backups consume disk until an operator reviews
+them. Keep backups until all old writers have stopped and their late writes have
+been reviewed.
+
+Inspect and reconcile without the original source directory:
+
+```bash
+openclaw skills inspect sample --agent example --request-id example-replace-1 --json
+openclaw skills recover sample --agent example --request-id example-replace-1 --json
+```
+
+Request inspection is read-only. It returns the recorded `receipt` and current
+`observations` for its target, stage, backup, and operation directory; it does not
+initialize a missing receipt table. The request must match this exact canonical
+destination and workspace identity. Inspection remains available when the source
+was removed or edited. Recovery is an explicit mutation under exclusive offline
+SQLite maintenance custody, serialized with in-process installs. It uses the
+same journal and publication owner, never a new installation.
+
+- Before target mutation (`intent`/`prepared`), recovery settles a conflict and
+  retains staging artifacts.
+- Around displacement/restoration (`detaching`/`detached`/`restoring`), it restores
+  the recorded backup only into an absent target using strict native no-replace.
+  An existing destination and displaced backup are both retained for operator review.
+- During `publishing`, it recognizes the recorded stage at the target only after
+  the stage name disappeared, identity and complete revision match, and moved
+  parents are durably synced. It records installation without replaying tracking
+  or hooks; those effects may remain incomplete. Otherwise it never republishes;
+  it can restore a recorded backup only into an absent target.
+- Unreadable or rebound recorded artifact identities require recovery without
+  filesystem effects. The target reservation remains active until safe settlement
+  can be established. Settled conflicts release it, including preserved-both-tree
+  outcomes that still require operator review.
+
+Repeating identical install inputs can perform the same reconciliation under
+offline custody. Stop writers and inspect first; use `recover` if the temporary
+source is gone. If recovery remains unresolved, preserve the database/WAL and all
+reported paths for maintainer review. Do not manually edit SQLite, delete receipts,
+force-install over the target, or discard a backup to bypass recovery. This command
+is reconciliation, not cleanup, and cannot reconstruct an unrecorded successor or
+prove what an external writer did after a move.
+
+Unsupported inputs include Git, registry, archive, remote workspace adapters,
+remote Gateway targets, PostgreSQL shared state, force/registry flags, and a host
+or filesystem lacking native no-replace or durable directory synchronization.
+There is no check-and-rename or
+copy fallback. Install policy still evaluates the staged local content; warnings
+require the existing explicit acknowledgement, and denial/failure cannot be
+bypassed by a condition or request ID.
+
+### Conditional install storage proposal
+
+**Draft design: pending upstream maintainer acceptance.** The dedicated first-use
+`skill_local_install_requests` table in `openclaw.sqlite` owns permanent request
+bindings, target reservations, phase/intents, artifact paths and identities, and
+results. Reservations use workspace identity and case-folded ASCII slugs, so case
+aliases conflict even on case-sensitive filesystems. It is separate from expiring
+uploads and the retired skill lifecycle.
+The shared worker performs synchronous Kysely transactions under existing
+exclusive offline admission for this CLI-only Draft. Receipt commits use operation-scoped SQLite `FULL`
+synchronization; prepared trees and moved parents use filesystem durability
+syncs. This adds no Gateway main-thread database access.
+
+The additive table and its active-target uniqueness index are created on first
+conditional use, without a numeric schema-version bump. There is no backfill,
+expiry, retention sweep, or automatic receipt deletion; storage grows with request
+count and retained trees. Receipts contain local paths but no source file bodies.
+Back up the shared database together with retained directories. Restoring only an
+older database loses request history and can no longer establish idempotency for
+filesystem effects performed afterward.
+
+Older builds do not implement these reservations or recovery semantics. Preserve
+the table and artifacts during downgrade; do not use an older writer to continue
+an incomplete operation. Package rollback alone does not undo filesystem moves.
+The table, permanent retention, durability cost, recovery workflow, and downgrade
+contract require maintainer design acceptance before this Draft is ready to land.
+
+## Install policy
 
 Gateway-backed skill dependency installs triggered from onboarding or Skills
 settings use the separate `skills.install` request path instead.

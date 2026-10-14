@@ -7,6 +7,10 @@ import {
 } from "./worker-operation-registry.js";
 
 const loaders = {
+  conditionalSkillInstall: () =>
+    import("../skills/lifecycle/conditional-install.worker.js").then(
+      (m) => m.conditionalSkillInstallReadOperations,
+    ),
   machineState: () =>
     import("./config-machine-state.read.worker.js").then((m) => m.machineStateReadOperations),
   projects: () =>

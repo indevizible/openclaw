@@ -56,6 +56,18 @@
       "file": "fragment-worker_environment_session_attachments.postgres.sql"
     },
     {
+      "id": "skill_local_install_requests",
+      "tables": [
+        "skill_local_install_requests"
+      ],
+      "indexes": [
+        "idx_skill_local_install_active_target"
+      ],
+      "dependencies": [],
+      "activation": "first-use",
+      "file": "fragment-skill_local_install_requests.postgres.sql"
+    },
+    {
       "id": "user_background_images",
       "tables": [
         "user_background_images"

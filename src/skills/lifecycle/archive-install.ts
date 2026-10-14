@@ -105,6 +105,12 @@ export async function installExtractedSkillRoot(
         : undefined;
     const captureChanges = hasCommittedSkillChangeHooks();
     const workspaceAccess = getAgentWorkspaceAccess(params.workspaceDir, "loadSkills");
+    if (params.conditional && getAgentWorkspaceAccess(params.workspaceDir)) {
+      return installFailure(
+        "Conditional installs require a local workspace filesystem.",
+        "invalid-request",
+      );
+    }
     const access = workspaceAccess?.loadSkills ? workspaceAccess : undefined;
     if (access && !access.applySkillRoot) {
       throw new WorkspaceAccessUnavailableError(
@@ -122,7 +128,7 @@ export async function installExtractedSkillRoot(
     const result = await applyRoot({
       ...files,
       ...(captureChanges ? { changes: { source: changeSource, sourceVersion } } : {}),
-      beforeInstall: async (mode) => {
+      beforeInstall: async (mode, sourceDir) => {
         if (!params.policy) {
           return undefined;
         }
@@ -136,7 +142,7 @@ export async function installExtractedSkillRoot(
           source: params.policy.source,
           mode,
           skillName: params.slug,
-          sourceDir: params.extractedRoot,
+          sourceDir: sourceDir ?? params.extractedRoot,
         });
         params.beforePersistentApply?.();
         return scanResult?.blocked
@@ -175,12 +181,13 @@ export async function installExtractedSkillRoot(
       }
     };
     const transaction = result.transaction;
-    if (!transaction) {
+    if (!transaction && !result.conditional?.repeated) {
       await publishChange();
     }
     return {
       ok: true,
       targetDir: result.targetDir,
+      ...(result.conditional ? { conditional: result.conditional } : {}),
       ...(transaction
         ? {
             transaction: {
@@ -229,8 +236,14 @@ export async function applyExtractedSkillRoot(
     if (params.deferCommit && params.expectedClawHubState && !targetExists) {
       return installFailure("Guarded skill update target disappeared.", "invalid-request");
     }
-    const effectiveMode = params.mode === "update" && targetExists ? "update" : "install";
-    if (params.mode === "install" && targetExists) {
+    const effectiveMode = params.conditional
+      ? params.conditional.condition.kind === "revision"
+        ? "update"
+        : "install"
+      : params.mode === "update" && targetExists
+        ? "update"
+        : "install";
+    if (!params.conditional && params.mode === "install" && targetExists) {
       return installFailure(
         `Skill already exists at ${targetDir}. Re-run with force/update.`,
         "invalid-request",
@@ -246,7 +259,9 @@ export async function applyExtractedSkillRoot(
       });
     const before =
       params.changes && effectiveMode === "update" ? await snapshot(params.changes) : undefined;
-    const policyFailure = await params.beforeInstall?.(effectiveMode);
+    const policyFailure = params.conditional
+      ? undefined
+      : await params.beforeInstall?.(effectiveMode);
     if (policyFailure) {
       return installFailure(policyFailure.error, policyFailure.failureKind);
     }
@@ -265,6 +280,17 @@ export async function applyExtractedSkillRoot(
       requireExistingTarget: Boolean(params.deferCommit && expectedClawHubState),
       hasDeps: false,
       depsLogMessage: "",
+      ...(params.conditional
+        ? {
+            conditional: params.conditional,
+            afterCopy: async (stageDir: string) => {
+              const failure = await params.beforeInstall?.(effectiveMode, stageDir);
+              if (failure) {
+                throw new Error(failure.error);
+              }
+            },
+          }
+        : {}),
       ...(expectedClawHubState !== undefined
         ? {
             afterBackup: async (backupDir: string) => {
@@ -294,6 +320,9 @@ export async function applyExtractedSkillRoot(
         ...installFailure(install.error, replacementBlocked ? "invalid-request" : "unavailable"),
         ...(replacementBlocked ? { replacementBlocked } : {}),
         ...(install.recoveryIncomplete ? { recoveryIncomplete: true } : {}),
+        ...(install.conditional
+          ? { conditional: install.conditional, observations: install.observations }
+          : {}),
       };
     }
     const transaction = resolvePackageDirInstallTransaction(install);
@@ -313,6 +342,7 @@ export async function applyExtractedSkillRoot(
       mode: effectiveMode,
       before,
       after,
+      ...(install.conditional ? { conditional: install.conditional } : {}),
       ...(transaction ? { transaction } : {}),
     };
   } catch (err) {
